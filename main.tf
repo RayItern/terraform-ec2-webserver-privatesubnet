@@ -35,7 +35,32 @@ resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 }
 
-# Create Route Table for Public Subnets
+# Create NAT Gateway
+resource "aws_eip" "nat_eip" {
+  # Removed vpc = true as it's deprecated
+}
+
+resource "aws_nat_gateway" "nat_gw" {
+  allocation_id = aws_eip.nat_eip.id
+  subnet_id     = aws_subnet.public_a.id
+}
+
+# Route Table for Private Subnet
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.nat_gw.id
+  }
+}
+
+resource "aws_route_table_association" "private" {
+  subnet_id      = aws_subnet.private.id
+  route_table_id = aws_route_table.private.id
+}
+
+# Route Table for Public Subnets
 resource "aws_route_table" "public" {
   vpc_id = aws_vpc.main.id
 
@@ -45,7 +70,6 @@ resource "aws_route_table" "public" {
   }
 }
 
-# Associate Public Subnets with Route Table
 resource "aws_route_table_association" "public_a" {
   subnet_id      = aws_subnet.public_a.id
   route_table_id = aws_route_table.public.id
@@ -56,7 +80,7 @@ resource "aws_route_table_association" "public_b" {
   route_table_id = aws_route_table.public.id
 }
 
-# Create Security Group
+# Security Group
 resource "aws_security_group" "web_sg" {
   vpc_id = aws_vpc.main.id
 
@@ -125,17 +149,15 @@ resource "aws_iam_instance_profile" "ec2_instance_profile" {
   role = aws_iam_role.ec2_role.name
 }
 
-# Data Source for Ubuntu AMI
-
 # Launch Template
 resource "aws_launch_template" "web_lt" {
   name_prefix   = "web-template-"
-  image_id      = "ami-0075013580f6322a1"
+  image_id      = "ami-0075013580f6322a1"  # Update with your AMI ID
   instance_type = "t2.micro"
 
   vpc_security_group_ids = [aws_security_group.web_sg.id]
 
-  user_data = filebase64("userdata.sh")
+  user_data = filebase64("userdata.sh")  # Ensure your userdata script is correct
 
   iam_instance_profile {
     name = aws_iam_instance_profile.ec2_instance_profile.name
@@ -147,7 +169,7 @@ resource "aws_autoscaling_group" "web_asg" {
   desired_capacity     = 1
   max_size             = 3
   min_size             = 1
-  vpc_zone_identifier  = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+  vpc_zone_identifier  = [aws_subnet.private.id]
 
   launch_template {
     id      = aws_launch_template.web_lt.id
@@ -172,7 +194,7 @@ resource "aws_autoscaling_policy" "scale_out" {
       predefined_metric_type = "ASGAverageCPUUtilization"
     }
 
-    target_value = 80  # Target average CPU utilization percentage
+    target_value = 80
   }
 }
 
@@ -186,7 +208,7 @@ resource "aws_autoscaling_policy" "scale_in" {
       predefined_metric_type = "ASGAverageCPUUtilization"
     }
 
-    target_value = 60  # Target average CPU utilization percentage
+    target_value = 60
   }
 }
 
@@ -197,14 +219,11 @@ resource "aws_cloudwatch_metric_alarm" "cpu_high" {
   evaluation_periods  = "2"
   metric_name         = "CPUUtilization"
   namespace           = "AWS/EC2"
-  period              = "300"
+  period              = "60"
   statistic           = "Average"
   threshold           = "80"
 
   alarm_actions = [aws_autoscaling_policy.scale_out.arn]
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.web_asg.name
-  }
 }
 
 resource "aws_cloudwatch_metric_alarm" "cpu_low" {
@@ -213,36 +232,40 @@ resource "aws_cloudwatch_metric_alarm" "cpu_low" {
   evaluation_periods  = "2"
   metric_name         = "CPUUtilization"
   namespace           = "AWS/EC2"
-  period              = "300"
+  period              = "60"
   statistic           = "Average"
   threshold           = "60"
 
   alarm_actions = [aws_autoscaling_policy.scale_in.arn]
-  dimensions = {
-    AutoScalingGroupName = aws_autoscaling_group.web_asg.name
-  }
 }
 
-# Application Load Balancer
-resource "aws_lb" "web_lb" {
-  name               = "web-lb"
+# Load Balancer
+resource "aws_lb" "main" {
+  name               = "main-lb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.web_sg.id]
   subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
 }
 
-# Load Balancer Target Group
+# Target Group
 resource "aws_lb_target_group" "web_tg" {
   name     = "web-tg"
   port     = 80
   protocol = "HTTP"
   vpc_id   = aws_vpc.main.id
+  health_check {
+    path                = "/health"  # Make sure this matches your application's health endpoint
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
 }
 
-# Load Balancer Listener
-resource "aws_lb_listener" "web_listener" {
-  load_balancer_arn = aws_lb.web_lb.arn
+# Listener
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.main.arn
   port              = 80
   protocol          = "HTTP"
 
@@ -252,9 +275,12 @@ resource "aws_lb_listener" "web_listener" {
   }
 }
 
-# Attach Auto Scaling Group to Target Group
+# Auto Scaling Group Attachment
 resource "aws_autoscaling_attachment" "asg_attachment" {
   autoscaling_group_name = aws_autoscaling_group.web_asg.name
   lb_target_group_arn   = aws_lb_target_group.web_tg.arn
+  depends_on = [
+    aws_lb.main,
+    aws_lb_target_group.web_tg
+  ]
 }
-
